@@ -8,17 +8,23 @@ import qualified Data.Csv as Csv
 import Data.Foldable (toList)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (fromMaybe)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Time (NominalDiffTime, UTCTime, parseTimeM)
 import qualified Data.Time as Time
+import qualified Data.Time.Calendar.WeekDate as Time
 import qualified Data.Time.Format.ISO8601 as Time
 import GHC.Generics (Generic)
+import Numeric.Natural (Natural)
+import Options.Applicative (strOption)
+import qualified Options.Applicative as Options
 import System.Environment (getArgs)
+import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 import Text.Printf (printf)
 
-newtype ISOTime = ISOTime UTCTime
+newtype ISOTime = ISOTime {getISOTime :: UTCTime}
   deriving (Show)
 
 instance Csv.FromField ISOTime where
@@ -43,15 +49,29 @@ instance Semigroup Duration where
 instance Monoid Duration where
   mempty = Duration 0
 
-newtype Durations = Durations (Map String Duration)
+data Durations = Durations Duration (Map String Duration)
 
 durationPercent :: Duration -> Duration -> Float
 durationPercent (Duration a) (Duration b) = realToFrac a / realToFrac b
 
 instance Show Durations where
-  show (Durations a) = unlines $ fmap showDuration (Map.toList a)
+  show (Durations week a) =
+    unlines $
+      fmap showDuration (Map.toList a)
+        <> [ "",
+             showTotal
+           ]
     where
       total = mconcat (toList a)
+      weekRatio :: Duration -> Float
+      weekRatio d = durationPercent d week * 100
+      showTotal =
+        mconcat
+          [ "total: ",
+            show total,
+            " ",
+            "(" <> printf "%3.3f" (weekRatio total) <> "% of week)"
+          ]
       showDuration (project, d) =
         mconcat
           [ project,
@@ -60,35 +80,94 @@ instance Show Durations where
             " ",
             "(" <> printf "%3.3f" ratio <> "%)",
             " ",
-            "(" <> printf "%3.3f" weekRatio <> "%)"
+            "(" <> printf "%3.3f" (weekRatio d) <> "% of week)"
           ]
         where
-          ratio, weekRatio :: Float
+          ratio :: Float
           ratio = durationPercent d total * 100
-          week :: Duration
-          week = Duration (40 * 60 * 60)
-          weekRatio = durationPercent d week * 100
 
 instance Semigroup Durations where
-  Durations a <> Durations b = Durations (Map.unionWith (<>) a b)
+  Durations week a <> Durations _ b = Durations week (Map.unionWith (<>) a b)
 
-instance Monoid Durations where
-  mempty = Durations mempty
-
-timeDiff :: Project -> Project -> Durations
-timeDiff (Project (ISOTime a) name) (Project (ISOTime b) _) =
-  Durations $ Map.singleton name (Duration $ Time.diffUTCTime b a)
+timeDiff :: Duration -> Project -> Project -> Durations
+timeDiff week (Project (ISOTime a) name) (Project (ISOTime b) _) =
+  Durations week $ Map.singleton name (Duration $ Time.diffUTCTime b a)
 
 removeLogout :: Durations -> Durations
-removeLogout (Durations d) = Durations $ Map.delete "logout" d
+removeLogout (Durations week d) = Durations week $ Map.delete "logout" d
+
+getStartOfWeek :: UTCTime -> UTCTime
+getStartOfWeek t = Time.UTCTime day' 0
+  where
+    day = Time.utctDay t
+    (year, week, _) = Time.toWeekDate day
+    day' = Time.fromWeekDate year week 1 -- Monday of the same week
+
+data Args = Args
+  { startDate :: Maybe UTCTime,
+    endDate :: Maybe UTCTime,
+    logFile :: FilePath,
+    weekHours :: Natural
+  }
+
+parseDate :: Options.ReadM UTCTime
+parseDate = Options.eitherReader $ \str ->
+  case Time.iso8601ParseM str of
+    Nothing -> Left $ "cannot parse date: " <> str
+    Just day -> pure (Time.UTCTime day 0)
+
+args :: Options.Parser Args
+args =
+  Args
+    <$> Options.optional
+      ( Options.option
+          parseDate
+          (Options.long "start-date" <> Options.metavar "YYYY-MM-DD")
+      )
+    <*> Options.optional
+      ( Options.option
+          parseDate
+          (Options.long "end-date" <> Options.metavar "YYYY-MM-DD")
+      )
+    <*> Options.strArgument (Options.metavar "FILE")
+    <*> Options.option
+      Options.auto
+      ( Options.long "hours"
+          <> Options.value 40
+          <> Options.showDefault
+      )
+
+parserOptions :: Options.ParserInfo Args
+parserOptions =
+  Options.info (Options.helper <*> args) $
+    Options.fullDesc
+      <> Options.progDesc "Count the hours spent on each project"
+      <> Options.header "count-hours"
+
+concatDurations :: Duration -> [Durations] -> Durations
+concatDurations weekDuration = foldr (<>) (Durations weekDuration mempty)
 
 run :: IO ()
 run = do
-  [file] <- getArgs
+  Args mstart mend file weekHours <- Options.execParser parserOptions
   bytes <- LazyByteString.readFile file
   case Csv.decode Csv.HasHeader bytes of
     Left err -> hPutStrLn stderr err
     Right rows -> do
       now <- Time.getCurrentTime
-      let rows' = toList rows <> [Project (ISOTime now) "dummy"]
-       in print $ removeLogout $ mconcat $ zipWith timeDiff rows' (tail rows')
+      let weekDuration = Duration $ fromIntegral weekHours * 60 * 60
+      let start = fromMaybe (getStartOfWeek now) mstart
+      let end = fromMaybe now mend
+      let inRange row =
+            let t = getISOTime (started row)
+             in t >= start && t <= end
+      let rows' = filter inRange (toList rows <> [Project (ISOTime now) "dummy"])
+       in case rows' of
+            [] -> do
+              hPutStrLn stderr "No rows in range"
+              exitFailure
+            _ ->
+              print $
+                removeLogout $
+                  concatDurations weekDuration $
+                    zipWith (timeDiff weekDuration) rows' (tail rows')
