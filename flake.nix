@@ -33,8 +33,12 @@
         pkgs = import nixpkgs { inherit system overlays; inherit (haskellNix) config; };
         flake = pkgs.helloProject.flake { };
       in
-      flake // {
+      flake // rec {
         # Built by `nix build .`
+        defaultApp = flake-utils.lib.mkApp {
+          exePath = "/bin/count-hours";
+          drv = defaultPackage;
+        };
         defaultPackage = flake.packages."count-hours:exe:count-hours";
       });
 }
