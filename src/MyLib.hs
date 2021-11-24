@@ -5,6 +5,7 @@ module MyLib (run) where
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Csv as Csv
+import Data.Fixed (divMod')
 import Data.Foldable (toList)
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -41,7 +42,17 @@ newtype Duration = Duration
   }
 
 instance Show Duration where
-  show (Duration d) = Time.formatTime Time.defaultTimeLocale "%H:%M:%S" d
+  show (Duration d)
+    | d == 0 = "0s"
+    | otherwise =
+      unwords $
+        [show hours <> "h" | hours > 0]
+          <> [show minutes <> "m" | minutes > 0]
+          <> [printf "%2.1fs" (realToFrac seconds :: Float) | seconds > 0]
+    where
+      hours, minutes :: Natural
+      (hours, hRest) = divMod' d (60 * 60)
+      (minutes, seconds) = divMod' hRest 60
 
 instance Semigroup Duration where
   Duration a <> Duration b = Duration (a + b)
@@ -55,7 +66,7 @@ durationPercent :: Duration -> Duration -> Float
 durationPercent (Duration a) (Duration b) = realToFrac a / realToFrac b
 
 instance Show Durations where
-  show (Durations week a) =
+  show (Durations working a) =
     unlines $
       fmap showDuration (Map.toList a)
         <> [ "",
@@ -64,7 +75,7 @@ instance Show Durations where
     where
       total = mconcat (toList a)
       weekRatio :: Duration -> Float
-      weekRatio d = durationPercent d week * 100
+      weekRatio d = durationPercent d working * 100
       showTotal =
         mconcat
           [ "total: ",
@@ -72,7 +83,7 @@ instance Show Durations where
             " ",
             "(" <> printf "%3.3f" (weekRatio total) <> "% of working hours",
             " - ",
-            show week,
+            show working,
             ")"
           ]
       showDuration (project, d) =
@@ -160,7 +171,8 @@ run = do
       now <- Time.getCurrentTime
       let start = fromMaybe (getStartOfWeek now) mstart
       let end = fromMaybe now mend
-      let weekDuration = Duration $ 8 * 60 * 60 * fromIntegral (length (weekDays start end) - fromIntegral vacations)
+      let workingDays = length (weekDays start end) - fromIntegral vacations
+      let workingDuration = Duration $ 8 * 60 * 60 * fromIntegral workingDays
       let inRange row =
             let t = getISOTime (started row)
              in t >= start && t <= end
@@ -169,11 +181,12 @@ run = do
             [] -> do
               hPutStrLn stderr "No rows in range"
               exitFailure
-            _ ->
+            _ -> do
+              print workingDays
               print $
                 removeLogout $
-                  concatDurations weekDuration $
-                    zipWith (timeDiff weekDuration) rows' (tail rows')
+                  concatDurations workingDuration $
+                    zipWith (timeDiff workingDuration) rows' (tail rows')
 
 days :: UTCTime -> UTCTime -> [Time.Day]
 days start end = takeWhile (\d -> Time.UTCTime d 0 < end) [startDay ..]
