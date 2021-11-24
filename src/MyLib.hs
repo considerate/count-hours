@@ -70,7 +70,10 @@ instance Show Durations where
           [ "total: ",
             show total,
             " ",
-            "(" <> printf "%3.3f" (weekRatio total) <> "% of week)"
+            "(" <> printf "%3.3f" (weekRatio total) <> "% of working hours",
+            " - ",
+            show week,
+            ")"
           ]
       showDuration (project, d) =
         mconcat
@@ -80,7 +83,7 @@ instance Show Durations where
             " ",
             "(" <> printf "%3.3f" ratio <> "%)",
             " ",
-            "(" <> printf "%3.3f" (weekRatio d) <> "% of week)"
+            "(" <> printf "%3.3f" (weekRatio d) <> "% of working hours)"
           ]
         where
           ratio :: Float
@@ -107,7 +110,7 @@ data Args = Args
   { startDate :: Maybe UTCTime,
     endDate :: Maybe UTCTime,
     logFile :: FilePath,
-    weekHours :: Natural
+    vacationDays :: Natural
   }
 
 parseDate :: Options.ReadM UTCTime
@@ -132,8 +135,8 @@ args =
     <*> Options.strArgument (Options.metavar "FILE")
     <*> Options.option
       Options.auto
-      ( Options.long "hours"
-          <> Options.value 40
+      ( Options.long "vacations"
+          <> Options.value 0
           <> Options.showDefault
       )
 
@@ -149,15 +152,15 @@ concatDurations weekDuration = foldr (<>) (Durations weekDuration mempty)
 
 run :: IO ()
 run = do
-  Args mstart mend file weekHours <- Options.execParser parserOptions
+  Args mstart mend file vacations <- Options.execParser parserOptions
   bytes <- LazyByteString.readFile file
   case Csv.decode Csv.HasHeader bytes of
     Left err -> hPutStrLn stderr err
     Right rows -> do
       now <- Time.getCurrentTime
-      let weekDuration = Duration $ fromIntegral weekHours * 60 * 60
       let start = fromMaybe (getStartOfWeek now) mstart
       let end = fromMaybe now mend
+      let weekDuration = Duration $ 8 * 60 * 60 * fromIntegral (length (weekDays start end) - fromIntegral vacations)
       let inRange row =
             let t = getISOTime (started row)
              in t >= start && t <= end
@@ -171,3 +174,21 @@ run = do
                 removeLogout $
                   concatDurations weekDuration $
                     zipWith (timeDiff weekDuration) rows' (tail rows')
+
+days :: UTCTime -> UTCTime -> [Time.Day]
+days start end = takeWhile (\d -> Time.UTCTime d 0 < end) [startDay ..]
+  where
+    startDay = Time.utctDay start
+
+weekDays :: UTCTime -> UTCTime -> [Time.Day]
+weekDays start end = filter isWeekDay (days start end)
+  where
+    isWeekDay day =
+      case Time.dayOfWeek day of
+        Time.Monday -> True
+        Time.Tuesday -> True
+        Time.Wednesday -> True
+        Time.Thursday -> True
+        Time.Friday -> True
+        Time.Saturday -> False
+        Time.Sunday -> False
